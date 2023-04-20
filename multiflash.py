@@ -20,9 +20,10 @@ import psutil
 import serial
 import serial.tools.list_ports
 
-logging.basicConfig(format="%(asctime)s %(threadName)s %(levelname)s %(message)s", level=logging.DEBUG)
+logging.basicConfig(format="%(asctime)s %(threadName)s %(levelname)s %(message)s",
+                    level=logging.INFO)
 
-DESIRED_CPY_VERSION = "7.2.5"
+DESIRED_CPY_VERSION = "8.0.5"
 SOURCE_CONTENT = Path(__file__).parent / "content"
 EMPTY_FS_FILES = {
     ".fseventsd",
@@ -44,10 +45,8 @@ done_devices = set()
 
 DONE_SCRIPT = """
     from adafruit_circuitplayground import cp
-    from rainbowio import colorwheel
     cp.pixels.brightness = 0.0625
-    cp.pixels[:5] = [0xbb22bb for n in range(5)]
-    cp.pixels[5:] = [colorwheel(n * 25) for n in range(5)]
+    cp.pixels[:] = [0x22cc28 for n in range(10)]
 """
 
 
@@ -154,8 +153,9 @@ def discover_devices(once=False, specific_serial_no=None, fetch=True):
             if (
                 device.serial_no in seen_devices
                 and seen_devices[device.serial_no] == device
-                and (datetime.now() - device.last_seen_at) <= timedelta(seconds=120)
+                # and (datetime.now() - device.last_seen_at) <= timedelta(seconds=900)
             ):
+                logging.warning("Ignoring %s", device.serial_no)
                 continue
 
             seen_devices[device.serial_no] = device
@@ -173,15 +173,16 @@ def discover_devices(once=False, specific_serial_no=None, fetch=True):
 
 def bootloader_flash(device: DeviceInfo):
     # Install CircuitPython
-    logging.info("Installing cp_cpb.uf2 to %s (%s)", device.mount_point, device.serial_no)
-    shutil.copy("cp_cpb.uf2", Path(device.mount_point) / "firmware.uf2")
+    logging.info("Installing firmware.uf2 to %s (%s)", device.mount_point, device.serial_no)
+    (Path(device.mount_point) / "firmware.uf2").write_bytes(
+        Path("firmware.uf2").read_bytes())
     wait_for_device(device)
     logging.info("Done bootloader for %s", device.mount_point)
 
 
-def wait_for_device(device, timeout=60, require_mount=False):
+def wait_for_device(device, timeout=60, require_mount=False, reason=""):
     started = datetime.now()
-    logging.info("Waiting for %s", device.serial_no)
+    logging.info("Waiting for %s %s", device.serial_no, f" ({reason})" if reason else "")
     orig_device = device
     while True:
         if datetime.now() - started > timedelta(seconds=timeout):
@@ -211,7 +212,6 @@ def get_circuitpython_version(device):
     return version.group(1)
 
 
-
 def content_flash(device: DeviceInfo):
     # Start by erasing filesystem
     try:
@@ -225,13 +225,13 @@ def content_flash(device: DeviceInfo):
             logging.warning("Filesystem differences: extra=%s, missing%s", extras, missing)
             device = erase_filesystem(device)
 
-        time.sleep(5)
         wait_for_device(device)
 
         # Check boot version
         cpy_version = get_circuitpython_version(device)
         if cpy_version < DESIRED_CPY_VERSION:
             logging.warning("Circuit Python version is %s", cpy_version)
+            logging.info("Upgrading")
 
             with serial.Serial(device.tty_device, timeout=5, exclusive=True) as serial_port:
                 serial_port: serial.Serial
@@ -243,10 +243,11 @@ def content_flash(device: DeviceInfo):
 
             logging.info("Waiting for device to restart")
             device = wait_for_device(device)
+        else:
+            logging.info("Running %s", cpy_version)
 
-        logging.info("Copying content")
+        logging.info("Copying content to board")
         copy_content(device)
-
         os.sync()
         logging.info("Done copying to %s", device)
         done_devices.add(device.serial_no)
@@ -272,22 +273,33 @@ def copy_content(device):
             continue
 
         logging.debug("- %s", dst)
-        shutil.copyfile(src=src, dst=dst)
+        shutil.copy(src=src, dst=dst)
         shutil.copymode(src=src, dst=dst)
+    for dotfiles in dst.glob("._*"):
+        dotfiles.unlink()
 
 
 def run_script(device, script, serial_port: Optional[serial.Serial] = None, timeout=15, description: str = ""):
     logging.info("Obtaining REPL")
     script = dedent(script).replace("\n", "\r").encode("utf-8")
 
-    def get_port():
-        if serial_port:
-            return serial_port
-        return serial.Serial(device.tty_device, timeout=timeout, exclusive=True)
+    def get_port(retry=True, retries=5, interval=1):
+        for attempt in range(retries if retry else 1):
+            try:
+                if serial_port:
+                    return serial_port
+                return serial.Serial(device.tty_device, timeout=timeout, exclusive=True)
+            except serial.serialutil.SerialException as exc:
+                logging.error("Serial error: %s")
+                time.sleep(interval)
 
     with get_port() as serial_port:
         serial_port: serial.Serial
         acquire_repl(serial_port)
+
+        boot_out = Path(device.mount_point) / "boot_out.txt"
+        if boot_out.exists():
+            logging.info("BOOT: %s", boot_out.read_text())
 
         logging.info("Running script %s", description)
         for line in script.splitlines():
@@ -298,7 +310,7 @@ def run_script(device, script, serial_port: Optional[serial.Serial] = None, time
         serial_port.write(script)
         serial_port.write([13])
         serial_port.flush()
-        time.sleep(0.025)
+        time.sleep(0.1)
         serial_port.write([4])
         serial_port.flush()
         with temporary_timeout(serial_port, 2):
@@ -325,13 +337,13 @@ def erase_filesystem(device):
                 """,
             description="erase filesystem",
         )
-        time.sleep(5)
+        time.sleep(1)
     except serial.SerialException:
         pass
 
     device = wait_for_device(device)
     while device.mount_point is None:
-        time.sleep(1)
+        time.sleep(0.5)
         device = wait_for_device(device)
     return device
 
@@ -347,14 +359,14 @@ def temporary_timeout(port: serial.Serial, timeout: int):
 def acquire_repl(serial_port):
     while True:
         serial_port.write(b'\r')
-        with temporary_timeout(serial_port, 2):
+        with temporary_timeout(serial_port, 1):
             output = serial_port.read_until(b">>> ")
             if b">>>" in output:
                 log_serial_output(output)
-                logging.info("Found running REPL")
+                logging.info("Found REPL")
                 return True
             else:
-                logging.debug("Sending Ctrl-C")
+                logging.info("Sending Ctrl-C")
                 serial_port.write(b"\003\r\r")  # Ctrl-C LF
                 if b">>>" in serial_port.read_until(b">>> "):
                     time.sleep(0.1)
@@ -391,9 +403,9 @@ def main():
                         in_progress.remove(task.name)
                         if source == 'content':
                             done_devices.add(task.name)
-                        logging.info("Device %s done %s", task.name, source)
+                        logging.info("Device %s done %s, len=%d", task.name, source,
+                                     len(tasks))
                     task.join()
-
 
         time.sleep(0.25)
 
