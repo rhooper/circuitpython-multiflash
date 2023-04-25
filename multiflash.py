@@ -153,7 +153,7 @@ def discover_devices(once=False, specific_serial_no=None, fetch=True):
             if (
                 device.serial_no in seen_devices
                 and seen_devices[device.serial_no] == device
-                # and (datetime.now() - device.last_seen_at) <= timedelta(seconds=900)
+                and (datetime.now() - device.last_seen_at) <= timedelta(seconds=120)
             ):
                 logging.warning("Ignoring %s", device.serial_no)
                 continue
@@ -166,7 +166,7 @@ def discover_devices(once=False, specific_serial_no=None, fetch=True):
             if device and device.serial_no not in in_progress and device not in done_devices:
                 yield device
 
-        time.sleep(0.25)
+        time.sleep(0.1)
         if once:
             return
 
@@ -222,7 +222,7 @@ def content_flash(device: DeviceInfo):
         missing = EMPTY_FS_FILES - fs_contents - EMPTY_FS_FILES
 
         if extras or missing:
-            logging.warning("Filesystem differences: extra=%s, missing%s", extras, missing)
+            logging.info("Filesystem differences: extra=%s, missing%s", extras, missing)
             device = erase_filesystem(device)
 
         wait_for_device(device)
@@ -283,14 +283,14 @@ def run_script(device, script, serial_port: Optional[serial.Serial] = None, time
     logging.info("Obtaining REPL")
     script = dedent(script).replace("\n", "\r").encode("utf-8")
 
-    def get_port(retry=True, retries=5, interval=1):
+    def get_port(retry=True, retries=10, interval=1):
         for attempt in range(retries if retry else 1):
             try:
                 if serial_port:
                     return serial_port
                 return serial.Serial(device.tty_device, timeout=timeout, exclusive=True)
             except serial.serialutil.SerialException as exc:
-                logging.error("Serial error: %s")
+                logging.error("Serial error: %s", exc)
                 time.sleep(interval)
 
     with get_port() as serial_port:
